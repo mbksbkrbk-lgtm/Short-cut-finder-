@@ -1,0 +1,6 @@
+Flask==2.2.5
+requests
+beautifulsoup4
+dateparser
+gunicorn
+sqlite3
