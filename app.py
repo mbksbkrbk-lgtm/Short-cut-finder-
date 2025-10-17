@@ -1,5 +1,6 @@
-from flask import Flask, render_template_string, jsonify, send_file
-import threading, time, csv, os, sqlite3
+# app.py
+from flask import Flask, jsonify, render_template_string, send_file
+import threading, time, csv, os
 from datetime import datetime, date
 import requests
 from bs4 import BeautifulSoup
@@ -7,24 +8,41 @@ from urllib.parse import urljoin, urlparse
 
 app = Flask(__name__)
 
+# ---------- CONFIG ----------
 START_URL = "https://goidirectory.gov.in"
-KEYWORDS = ["career","careers","recruit","recruitment","vacancy","vacancies","job","jobs","notification","advertisement","apply"]
-MAX_ORGS = 200
-REQUEST_SLEEP = 0.5
+KEYWORDS = ["vacancy","vacancies","recruit","recruitment","career","careers","job","jobs","notification","advertisement","apply"]
+MAX_ORGS = 300               # max orgs to consider from GoI directory
+REQUEST_SLEEP = 0.5          # polite delay between requests to same host
 REQUEST_TIMEOUT = 10
-DB = "gov_jobs.db"
+PER_ORG_CANDIDATES = 6      # how many candidate pages to visit per org
+PER_ORG_SUBPAGES = 8        # how many internal sub-pages to scan if no direct candidate found
 
-def init_db():
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY, source_site TEXT, dept_name TEXT, job_title TEXT, job_link TEXT, snippet TEXT, deadline_iso TEXT, deadline_unknown INTEGER, fetched_at TEXT)''')
-    conn.commit(); conn.close()
+# skip-list: famous/public sites we DO NOT want to crawl (hosts/domains)
+SKIP_HOSTS = [
+    "upsc.gov.in",
+    "ssc.nic.in",
+    "indianrailways.gov.in",
+    "railwayrecruitment.gov.in",
+    "rbi.org.in",
+    "nta.ac.in",
+    "mhrd.gov.in",
+    "indiacore.nic.in",
+    "employmentnews.gov.in",
+    "govtjobsportal.in",
+    "ssc.gov.in",
+    "joinindiancoastguard.gov.in",  # example
+    "ncs.gov.in",
+    "ntpc.co.in",
+    "powergridindia.com",
+    "psu.gov.in"
+]
 
-init_db()
-
+# storage (in-memory + optional csv files)
+results = []
 is_crawling = False
 _last_request_time = {}
 
+# ---------- helper functions ----------
 def polite_get(url):
     host = urlparse(url).netloc
     last = _last_request_time.get(host, 0)
@@ -32,21 +50,58 @@ def polite_get(url):
     if wait > 0:
         time.sleep(wait)
     try:
-        r = requests.get(url, timeout=REQUEST_TIMEOUT, headers={'User-Agent':'Mozilla/5.0'})
+        r = requests.get(url, timeout=REQUEST_TIMEOUT, headers={'User-Agent':'Mozilla/5.0 (compatible; GovVacBot/1.0)'})
         _last_request_time[host] = time.time()
         return r
-    except:
+    except Exception:
         return None
+
+def is_skippable(url):
+    host = urlparse(url).netloc.lower()
+    for s in SKIP_HOSTS:
+        if s in host:
+            return True
+    return False
+
+def fetch_orgs(limit=MAX_ORGS):
+    r = polite_get(START_URL)
+    if not r or r.status_code != 200:
+        return []
+    soup = BeautifulSoup(r.text, "html.parser")
+    anchors = soup.find_all('a', href=True)
+    orgs = []
+    seen = set()
+    for a in anchors:
+        href = a['href'].strip()
+        text = (a.get_text() or "").strip()
+        if not href:
+            continue
+        full = urljoin(START_URL, href)
+        parsed = urlparse(full)
+        if parsed.scheme not in ("http","https"):
+            continue
+        host = parsed.netloc
+        # skip famous hosts quickly
+        if any(s in host for s in SKIP_HOSTS):
+            continue
+        if full not in seen:
+            seen.add(full)
+            orgs.append((text or host, full))
+        if len(orgs) >= limit:
+            break
+    return orgs
 
 def find_candidate_links(base_url, soup):
     anchors = soup.find_all("a", href=True)
     found = []
     for a in anchors:
-        href = a['href'].strip(); text = (a.get_text() or "").strip()
+        href = a['href'].strip()
+        text = (a.get_text() or "").strip()
         low = (href + " " + text).lower()
         if any(k in low for k in KEYWORDS):
             full = urljoin(base_url, href)
             found.append((text or full, full))
+    # dedupe preserve order
     seen = set(); uniq = []
     for t,u in found:
         if u not in seen:
@@ -55,144 +110,168 @@ def find_candidate_links(base_url, soup):
 
 def extract_jobs_from_page(url):
     r = polite_get(url)
-    if not r or r.status_code != 200: return []
+    if not r or r.status_code != 200:
+        return []
     soup = BeautifulSoup(r.text, "html.parser")
     jobs = []
-    blocks = soup.find_all(['article','li','tr','div','p'], limit=200)
+    # quick heuristic: look for blocks mentioning deadline-like words
+    blocks = soup.find_all(['article','li','tr','div','p'], limit=300)
     for b in blocks:
         text = b.get_text(" ", strip=True)
-        if len(text) < 30: continue
-        if any(k in text.lower() for k in ["last date","closing date","apply by","deadline","last date to apply","closing on"]):
+        if len(text) < 40: 
+            continue
+        low = text.lower()
+        if any(x in low for x in ["last date","closing date","apply by","deadline","last date to apply","closing on","last date for"]):
+            # try title
             title = None
             for tag in ['h1','h2','h3','h4','strong','b']:
                 t = b.find(tag)
                 if t and t.get_text(strip=True):
                     title = t.get_text(strip=True); break
-            if not title: title = text[:120]
-            link_tag = b.find('a', href=True); link = url if not link_tag else urljoin(url, link_tag['href'])
+            if not title:
+                title = (text.split('.') or [text])[0][:140]
+            link_tag = b.find('a', href=True)
+            link = url if not link_tag else urljoin(url, link_tag['href'])
             snippet = text[:400]
+            # simple date parse (best-effort)
             deadline = None
             try:
                 import re, dateparser
-                m = re.search(r'(\d{1,2}[ /.-]\d{1,2}[ /.-]\d{2,4})', text)
+                m = re.search(r'\\d{1,2}[ /.-]\\d{1,2}[ /.-]\\d{2,4}', text)
                 if m:
-                    d = dateparser.parse(m.group(1))
-                    if d: deadline = d.date().isoformat()
+                    d = dateparser.parse(m.group(0))
+                    if d:
+                        deadline = d.date().isoformat()
             except:
                 pass
-            jobs.append({'title': title, 'link': link, 'snippet': snippet, 'deadline': deadline, 'deadline_unknown': 0 if deadline else 1})
+            jobs.append({'title': title, 'link': link, 'snippet': snippet, 'deadline': deadline})
+    # also include pdf links with recruitment keywords
     for a in soup.find_all('a', href=True):
         href = a['href']
         if href.lower().endswith('.pdf') and any(k in (a.get_text() or href).lower() for k in ['notification','advertisement','recruit','vacancy','apply']):
-            full = urljoin(url, href); title = a.get_text(strip=True) or full
-            jobs.append({'title': title, 'link': full, 'snippet': 'PDF', 'deadline': None, 'deadline_unknown': 1})
+            full = urljoin(url, href)
+            title = a.get_text(strip=True) or full
+            jobs.append({'title': title, 'link': full, 'snippet': 'PDF notification', 'deadline': None})
     return jobs
 
-def store_job(source_site, dept_name, job):
-    conn = sqlite3.connect(DB); c = conn.cursor()
-    c.execute('INSERT INTO jobs (source_site, dept_name, job_title, job_link, snippet, deadline_iso, deadline_unknown, fetched_at) VALUES (?,?,?,?,?,?,?,datetime("now"))',
-              (source_site, dept_name, job['title'], job['link'], job['snippet'], job['deadline'], job['deadline_unknown']))
-    conn.commit(); conn.close()
+def store_result(org_name, org_url, job):
+    results.append({
+        'org_name': org_name,
+        'org_url': org_url,
+        'title': job.get('title'),
+        'link': job.get('link'),
+        'snippet': job.get('snippet'),
+        'deadline': job.get('deadline'),
+        'fetched_at': datetime.utcnow().isoformat()
+    })
 
 def crawl_worker(orgs):
     saved = 0
-    for name,url in orgs:
+    for name, url in orgs:
+        # skip if host in SKIP_HOSTS (double-check)
+        if is_skippable(url):
+            continue
         try:
             r = polite_get(url); time.sleep(REQUEST_SLEEP)
-            if not r or r.status_code != 200: continue
+            if not r or r.status_code != 200:
+                continue
             soup = BeautifulSoup(r.text, "html.parser")
             candidates = find_candidate_links(url, soup)
+            # if none found, scan a few internal subpages (limited)
             if not candidates:
-                anchors = soup.find_all('a', href=True); subs = []
+                anchors = soup.find_all('a', href=True)
+                subs = []
                 for a in anchors[:60]:
                     full = urljoin(url, a['href'])
                     if urlparse(full).netloc == urlparse(url).netloc:
                         subs.append(full)
-                for sub in subs[:12]:
+                for sub in subs[:PER_ORG_SUBPAGES]:
                     r2 = polite_get(sub); time.sleep(REQUEST_SLEEP)
-                    if not r2: continue
+                    if not r2:
+                        continue
                     s2 = BeautifulSoup(r2.text, "html.parser")
                     found = find_candidate_links(sub, s2)
-                    if found: candidates.extend(found)
+                    if found:
+                        candidates.extend(found)
+            # visit each candidate page (limited)
             seen = set()
-            for t,link in candidates[:6]:
-                if link in seen: continue
+            for t, link in candidates[:PER_ORG_CANDIDATES]:
+                if link in seen:
+                    continue
                 seen.add(link)
                 jobs = extract_jobs_from_page(link)
                 for job in jobs:
+                    # if deadline present and expired, skip
                     try:
-                        if job['deadline'] and job['deadline'] < str(date.today()):
-                            continue
-                    except: pass
-                    store_job(url, t or name, job); saved += 1
+                        if job.get('deadline'):
+                            if job['deadline'] < str(date.today()):
+                                continue
+                    except:
+                        pass
+                    store_result(name, url, job); saved += 1
                 time.sleep(REQUEST_SLEEP)
-        except:
+        except Exception:
             continue
     return saved
 
-def fetch_orgs(limit=MAX_ORGS):
-    r = polite_get(START_URL)
-    if not r or r.status_code != 200: return []
-    soup = BeautifulSoup(r.text, "html.parser")
-    anchors = soup.find_all('a', href=True)
-    orgs = []
-    for a in anchors:
-        href = a['href']; text = (a.get_text() or "").strip()
-        if not href: continue
-        full = urljoin(START_URL, href)
-        if ("gov.in" in full or "nic.in" in full or "govt.in" in full) and full not in [x[1] for x in orgs]:
-            orgs.append((text or full, full))
-        if len(orgs) >= limit: break
-    return orgs
+# ---------- main full crawl ----------
+crawl_thread = None
+_stop_flag = False
 
-crawl_thread = None; _stop_flag = False
-
-def full_crawl():
-    orgs = fetch_orgs()
-    batches = [orgs[i:i+8] for i in range(0, len(orgs), 8)]
+def full_filtered_crawl():
+    global _stop_flag
+    orgs = fetch_orgs(limit=MAX_ORGS)
+    # chunk to small batches
+    batches = [orgs[i:i+10] for i in range(0, len(orgs), 10)]
     for batch in batches:
-        if _stop_flag: break
+        if _stop_flag:
+            break
         crawl_worker(batch)
     return True
 
+# ---------- Flask endpoints ----------
 @app.route('/')
 def home():
-    return "<h2>Gov Vacancy Finder (optimized)</h2><p>Use /start-full-crawl to begin. Check /status and /results.</p>"
+    return "<h3>Gov Vacancy Finder (filtered) — use /start-filtered-crawl to begin. Check /status and /results</h3>"
 
-@app.route('/start-full-crawl')
-def start_full():
+@app.route('/start-filtered-crawl')
+def start_filtered():
     global crawl_thread, _stop_flag
     if crawl_thread and crawl_thread.is_alive():
-        return 'Crawl running', 400
+        return "Crawl already running", 400
     _stop_flag = False
-    crawl_thread = threading.Thread(target=full_crawl, daemon=True)
+    # clear previous results
+    results.clear()
+    crawl_thread = threading.Thread(target=full_filtered_crawl, daemon=True)
     crawl_thread.start()
-    return 'Crawl started', 200
+    return "Crawl started", 200
+
+@app.route('/stop-crawl')
+def stop_crawl():
+    global _stop_flag
+    _stop_flag = True
+    return "Stop requested", 200
 
 @app.route('/status')
 def status():
     running = crawl_thread.is_alive() if crawl_thread else False
-    conn = sqlite3.connect(DB); c = conn.cursor(); c.execute('SELECT COUNT(*) FROM jobs'); total = c.fetchone()[0]; conn.close()
-    return jsonify({'running': running, 'found': total})
+    return jsonify({'running': running, 'found': len(results)})
 
 @app.route('/results')
-def results():
-    conn = sqlite3.connect(DB); c = conn.cursor()
-    c.execute('SELECT source_site, dept_name, job_title, job_link, snippet, deadline_iso, deadline_unknown, fetched_at FROM jobs ORDER BY fetched_at DESC LIMIT 1000')
-    rows = c.fetchall(); conn.close()
-    keys = ['source_site','dept_name','job_title','job_link','snippet','deadline_iso','deadline_unknown','fetched_at']
-    out = [dict(zip(keys,row)) for row in rows]
-    return jsonify(out)
+def results_endpoint():
+    return jsonify(results)
 
 @app.route('/download')
 def download():
-    conn = sqlite3.connect(DB); c = conn.cursor(); c.execute('SELECT source_site, dept_name, job_title, job_link, snippet, deadline_iso, deadline_unknown, fetched_at FROM jobs ORDER BY fetched_at DESC'); rows = c.fetchall(); conn.close()
-    fname = f'gov_jobs_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
-    import csv as _csv
+    if not results:
+        return "No results yet", 404
+    fname = f'gov_filtered_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
     with open(fname, 'w', newline='', encoding='utf-8') as f:
-        writer = _csv.writer(f); writer.writerow(['source_site','dept_name','job_title','job_link','snippet','deadline_iso','deadline_unknown','fetched_at'])
-        for r in rows: writer.writerow(r)
+        writer = csv.writer(f)
+        writer.writerow(['org_name','org_url','title','link','snippet','deadline','fetched_at'])
+        for r in results:
+            writer.writerow([r.get('org_name'), r.get('org_url'), r.get('title'), r.get('link'), r.get('snippet'), r.get('deadline'), r.get('fetched_at')])
     return send_file(fname, as_attachment=True)
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=10000)
+    app.run(host="0.0.0.0", port=10000)
